@@ -1,11 +1,22 @@
 #pragma once
 
+// Stores unique keys, each with one Value (for the order book: a price level
+// holding its FIFO queue of resting orders). Keys are ordered by Compare, so
+// the "best" key is always the first one in Compare order:
+//   asks: AVLTree<Price, Level>                       -> lowest ask first
+//   bids: AVLTree<Price, Level, std::greater<Price>>  -> highest bid first
+//
+// Pointer stability: nodes are never copied or moved between tree positions
+// except by relinking, so a Value* returned by find()/get_or_insert() stays
+// valid until THAT key is erased (or the tree is cleared/destroyed). Erasing
+// some other key never invalidates it.
+
 #include <algorithm>
 #include <cstddef>
-#include <cstdint>
 #include <functional>
 #include <utility>
-#include "kit/counters.h" // Uses the starter kit's counter definitions[cite: 9]
+
+#include "kit/counters.h"
 
 namespace team {
 
@@ -19,7 +30,7 @@ public:
         Node* right;
         int height;
 
-        // Constructs a new leaf node with height 1 and forwards the value payload.
+        // Constructs a leaf node (height 1), forwarding the value payload.
         template <typename V>
         Node(const Key& k, V&& v)
             : key(k), value(std::forward<V>(v)), left(nullptr), right(nullptr), height(1) {}
@@ -29,192 +40,191 @@ private:
     Node* root_ = nullptr;
     std::size_t size_ = 0;
     Compare comp_;
-    mutable kit::Counters* counters_ = nullptr;
+    mutable kit::Counters stats_;  // mutable so const lookups can be counted
 
-    // Increments the comparison counter if counter struct is bound.
-    void inc_comparisons(uint64_t n = 1) const {
-        if (counters_) counters_->comparisons += n;
-    }
+    // Returns the cached height of n, or 0 if n is null.
+    static int height(const Node* n) { return n ? n->height : 0; }
 
-    // Increments the elements/nodes visited counter if counter struct is bound.
-    void inc_visited(uint64_t n = 1) const {
-        if (counters_) counters_->elements_visited += n;
-    }
-
-    // Increments the heap allocation counter when a new tree node is created.
-    void inc_allocations(uint64_t n = 1) const {
-        if (counters_) counters_->allocations += n;
-    }
-
-    // Increments the elements moved counter to record structural tree rotations.
-    void inc_moved(uint64_t n = 1) const {
-        if (counters_) counters_->elements_moved += n;
-    }
-
-    // Returns the cached height of node n, or 0 if n is null.
-    int height(Node* n) const {
-        return n ? n->height : 0;
-    }
-
-    // Computes the balance factor of node n.
-    int balance_factor(Node* n) const {
+    // Returns height(left) - height(right); > 0 means left-heavy.
+    static int balance_factor(const Node* n) {
         return n ? height(n->left) - height(n->right) : 0;
     }
 
-    // Recalculates and updates the height of node n based on its children's heights.
-    void update_height(Node* n) {
-        if (n) {
-            n->height = 1 + std::max(height(n->left), height(n->right));
-        }
+    // Recomputes n->height from its children.
+    static void update_height(Node* n) {
+        n->height = 1 + std::max(height(n->left), height(n->right));
     }
 
-    // Performs a single right rotation around node y to fix left-heavy imbalance.
+    // Single right rotation around y (fixes a left-left imbalance).
     Node* rotate_right(Node* y) {
-        inc_moved();
+        KIT_COUNT(stats_, moves);
         Node* x = y->left;
-        Node* T2 = x->right;
-
+        y->left = x->right;
         x->right = y;
-        y->left = T2;
-
         update_height(y);
         update_height(x);
         return x;
     }
 
-    // Performs a single left rotation around node x to fix right-heavy imbalance.
+    // Single left rotation around x (fixes a right-right imbalance).
     Node* rotate_left(Node* x) {
-        inc_moved();
+        KIT_COUNT(stats_, moves);
         Node* y = x->right;
-        Node* T2 = y->left;
-
+        x->right = y->left;
         y->left = x;
-        x->right = T2;
-
         update_height(x);
         update_height(y);
         return y;
     }
 
-    // Updates height and applies single or double rotations if |balance_factor| > 1.
+    // Updates node's height and applies a single or double rotation if |balance| > 1.
+    // Returns the new root of this subtree.
     Node* rebalance(Node* node) {
         update_height(node);
-        int bf = balance_factor(node);
+        const int bf = balance_factor(node);
 
         if (bf > 1) {
-            if (balance_factor(node->left) < 0) {
-                node->left = rotate_left(node->left); // Left-Right double rotation
-            }
-            return rotate_right(node); // Left-Left single rotation
+            if (balance_factor(node->left) < 0) node->left = rotate_left(node->left);  // left-right
+            return rotate_right(node);                                                  // left-left
         }
-
         if (bf < -1) {
-            if (balance_factor(node->right) > 0) {
-                node->right = rotate_right(node->right); // Right-Left double rotation
-            }
-            return rotate_left(node); // Right-Right single rotation
+            if (balance_factor(node->right) > 0) node->right = rotate_right(node->right);  // right-left
+            return rotate_left(node);                                                       // right-right
         }
-
         return node;
     }
 
-    // Recursively inserts a key-value pair (or finds existing key) and rebalances on unwind.
+ 
+    // Inserts (key, val) below node unless key exists; out_ptr receives the Value*
+    // for that key either way. Rebalances on the way back up.
     template <typename V>
     Node* insert_node(Node* node, const Key& key, V&& val, Value*& out_ptr) {
         if (!node) {
-            inc_allocations();
-            size_++;
+            KIT_COUNT(stats_, allocations);
+            ++size_;
             Node* created = new Node(key, std::forward<V>(val));
             out_ptr = &created->value;
             return created;
         }
 
-        inc_visited();
-        inc_comparisons();
+        KIT_COUNT(stats_, visits);
+        KIT_COUNT(stats_, comparisons);
         if (comp_(key, node->key)) {
             node->left = insert_node(node->left, key, std::forward<V>(val), out_ptr);
         } else {
-            inc_comparisons();
+            KIT_COUNT(stats_, comparisons);
             if (comp_(node->key, key)) {
                 node->right = insert_node(node->right, key, std::forward<V>(val), out_ptr);
             } else {
-                out_ptr = &node->value;
+                out_ptr = &node->value;  // key already present: nothing changes
                 return node;
             }
         }
-
         return rebalance(node);
     }
 
-    // Walks down the left spine to find the minimum node in a subtree.
-    Node* min_value_node(Node* node) const {
-        Node* current = node;
-        while (current && current->left) {
-            inc_visited();
-            current = current->left;
+
+    // Detaches the minimum node of the non-null subtree n and stores it in min_out
+    Node* detach_min(Node* n, Node*& min_out) {
+        KIT_COUNT(stats_, visits);
+        if (!n->left) {
+            min_out = n;
+            return n->right;
         }
-        return current;
+        n->left = detach_min(n->left, min_out);
+        return rebalance(n);
     }
 
-    // Recursively locates and deletes a node by key, then rebalances along the path back up.
-    Node* remove_node(Node* node, const Key& key, bool& removed) {
+    // Removes the node whose key equals `key` (if any) and rebalances on the way up.
+    // `key` must not alias a key stored inside the tree (erase() passes a copy).
+    Node* remove_node(Node* node, const Key& key) {
         if (!node) return nullptr;
 
-        inc_visited();
-        inc_comparisons();
+        KIT_COUNT(stats_, visits);
+        KIT_COUNT(stats_, comparisons);
         if (comp_(key, node->key)) {
-            node->left = remove_node(node->left, key, removed);
+            node->left = remove_node(node->left, key);
         } else {
-            inc_comparisons();
+            KIT_COUNT(stats_, comparisons);
             if (comp_(node->key, key)) {
-                node->right = remove_node(node->right, key, removed);
+                node->right = remove_node(node->right, key);
             } else {
-                removed = true;
+                // Found it.
                 if (!node->left || !node->right) {
-                    Node* temp = node->left ? node->left : node->right;
+                    Node* child = node->left ? node->left : node->right;
                     delete node;
-                    size_--;
-                    return temp;
-                } else {
-                    Node* successor = min_value_node(node->right);
-                    node->key = successor->key;
-                    node->value = std::move(successor->value);
-                    bool dummy = false;
-                    node->right = remove_node(node->right, successor->key, dummy);
+                    --size_;
+                    return child;
                 }
+                // Two children: relink the in-order successor into this position
+                // instead of copying its data, so surviving Value* stay valid.
+                Node* successor = nullptr;
+                Node* new_right = detach_min(node->right, successor);
+                successor->left = node->left;
+                successor->right = new_right;
+                KIT_COUNT(stats_, moves);
+                delete node;
+                --size_;
+                return rebalance(successor);
             }
         }
-
         return rebalance(node);
     }
 
-    // Performs a bounded in-order traversal, stopping once `limit` elements have been visited.
+    // Iterative search; returns the node holding `key`, or nullptr.
+    Node* find_node(const Key& key) const {
+        Node* curr = root_;
+        while (curr) {
+            KIT_COUNT(stats_, visits);
+            KIT_COUNT(stats_, comparisons);
+            if (comp_(key, curr->key)) {
+                curr = curr->left;
+            } else {
+                KIT_COUNT(stats_, comparisons);
+                if (comp_(curr->key, key)) curr = curr->right;
+                else return curr;
+            }
+        }
+        return nullptr;
+    }
+
+    // Returns the first node in Compare order (leftmost), or nullptr if empty.
+    Node* leftmost() const {
+        Node* curr = root_;
+        while (curr) {
+            KIT_COUNT(stats_, visits);
+            if (!curr->left) break;
+            curr = curr->left;
+        }
+        return curr;
+    }
+
+    // In-order traversal that stops as soon as `limit` elements were reported.
+    // Visits O(limit + log n) nodes, never the whole tree.
     template <typename Func>
-    void in_order_limit(Node* node, std::size_t limit, std::size_t& count, Func&& fn) const {
+    void in_order_limit(const Node* node, std::size_t limit, std::size_t& count, Func& fn) const {
         if (!node || count >= limit) return;
-
-        inc_visited();
+        KIT_COUNT(stats_, visits);
         in_order_limit(node->left, limit, count, fn);
-
         if (count < limit) {
             fn(node->key, node->value);
-            count++;
+            ++count;
             in_order_limit(node->right, limit, count, fn);
         }
     }
 
-    // Post-order recursive helper that deallocates every node in the tree.
-    void destroy_tree(Node* node) {
+    // Post-order delete of every node below (and including) node.
+    static void destroy_tree(Node* node) {
         if (!node) return;
         destroy_tree(node->left);
         destroy_tree(node->right);
         delete node;
     }
 
-    // Deep-copies a subtree recursively while preserving node heights.
-    Node* clone_tree(Node* other) {
+    // Deep-copies a subtree, preserving heights.
+    Node* clone_tree(const Node* other) {
         if (!other) return nullptr;
-        inc_allocations();
+        KIT_COUNT(stats_, allocations);
         Node* copy = new Node(other->key, other->value);
         copy->height = other->height;
         copy->left = clone_tree(other->left);
@@ -222,60 +232,83 @@ private:
         return copy;
     }
 
-public:
-    // Initializes an empty AVL tree with an optional pointer to starter-kit counters.
-    explicit AVLTree(kit::Counters* counters = nullptr) : counters_(counters) {}
-
-    // Destructor that frees all dynamically allocated nodes to prevent memory leaks.
-    ~AVLTree() {
-        destroy_tree(root_);
+   // Checks ordering (lo < key < hi), cached heights, and |balance| <= 1 below n.
+    bool validate_node(const Node* n, const Key* lo, const Key* hi,
+                       int& h, std::size_t& count) const {
+        if (!n) { h = 0; return true; }
+        if (lo && !comp_(*lo, n->key)) return false;
+        if (hi && !comp_(n->key, *hi)) return false;
+        int hl = 0, hr = 0;
+        if (!validate_node(n->left, lo, &n->key, hl, count)) return false;
+        if (!validate_node(n->right, &n->key, hi, hr, count)) return false;
+        ++count;
+        h = 1 + std::max(hl, hr);
+        return n->height == h && (hl - hr <= 1) && (hr - hl <= 1);
     }
 
-    // Copy constructor that performs a deep copy of another AVL tree.
-    AVLTree(const AVLTree& other)
-        : size_(other.size_), comp_(other.comp_), counters_(other.counters_) {
+public:
+    // Creates an empty tree.
+    explicit AVLTree(Compare comp = Compare()) : comp_(std::move(comp)) {}
+
+    // Frees every node.
+    ~AVLTree() { destroy_tree(root_); }
+
+    // Deep copy (counters start fresh, then count the copy's allocations).
+    AVLTree(const AVLTree& other) : size_(other.size_), comp_(other.comp_) {
         root_ = clone_tree(other.root_);
     }
 
-    // Copy assignment operator that cleans up existing nodes before deep-copying.
+    // Deep copy assignment.
     AVLTree& operator=(const AVLTree& other) {
         if (this != &other) {
-            destroy_tree(root_);
-            size_ = other.size_;
-            comp_ = other.comp_;
-            counters_ = other.counters_;
-            root_ = clone_tree(other.root_);
+            AVLTree tmp(other);
+            swap(tmp);
         }
         return *this;
     }
 
-    // Move constructor that transfers ownership of the root pointer; O(1) time.
+    // O(1) move: steals the nodes and the counters; `other` is left empty.
     AVLTree(AVLTree&& other) noexcept
-        : root_(other.root_), size_(other.size_), comp_(std::move(other.comp_)), counters_(other.counters_) {
+        : root_(other.root_), size_(other.size_), comp_(std::move(other.comp_)),
+          stats_(std::move(other.stats_)) {
         other.root_ = nullptr;
         other.size_ = 0;
+        other.stats_.reset();
     }
 
-    // Move assignment operator that frees current nodes and takes ownership from `other`.
+    // Move assignment: frees current nodes, then steals from `other`.
     AVLTree& operator=(AVLTree&& other) noexcept {
         if (this != &other) {
             destroy_tree(root_);
             root_ = other.root_;
             size_ = other.size_;
             comp_ = std::move(other.comp_);
-            counters_ = other.counters_;
+            stats_ = std::move(other.stats_);
             other.root_ = nullptr;
             other.size_ = 0;
+            other.stats_.reset();
         }
         return *this;
     }
 
-    // Updates the starter-kit counter struct.
-    void bind_counters(kit::Counters* counters) {
-        counters_ = counters;
+    // Swaps contents (nodes, comparator, counters) with another tree in O(1).
+    void swap(AVLTree& other) noexcept {
+        std::swap(root_, other.root_);
+        std::swap(size_, other.size_);
+        std::swap(comp_, other.comp_);
+        std::swap(stats_, other.stats_);
     }
 
-    // Inserts key with default_val if absent, or returns a pointer to the existing Value.
+ // Read-only access to this tree's operation counters.
+    const kit::Counters& stats() const { return stats_; }
+
+    // Zeroes the counters.
+    void reset_stats() { stats_.reset(); }
+
+
+
+    // Returns a pointer to the Value stored under `key`, inserting default_val first
+    // if the key is absent. The pointer stays valid until this key is erased.
     template <typename V>
     Value* get_or_insert(const Key& key, V&& default_val) {
         Value* result = nullptr;
@@ -283,63 +316,81 @@ public:
         return result;
     }
 
-    // Searches iteratively for `key` and returns a mutable pointer to its Value, or nullptr.
+    // Same, but a new entry is value-initialized (Value{}).
+    Value* get_or_insert(const Key& key) { return get_or_insert(key, Value{}); }
+
+    // Returns a pointer to the Value for `key`, or nullptr if absent. O(log n).
     Value* find(const Key& key) {
-        Node* curr = root_;
-        while (curr) {
-            inc_visited();
-            inc_comparisons();
-            if (comp_(key, curr->key)) {
-                curr = curr->left;
-            } else {
-                inc_comparisons();
-                if (comp_(curr->key, key)) {
-                    curr = curr->right;
-                } else {
-                    return &curr->value;
-                }
-            }
-        }
-        return nullptr;
+        Node* n = find_node(key);
+        return n ? &n->value : nullptr;
     }
 
-    // Const overload of find() returning a read-only pointer to the Value, or nullptr.
+    // Const overload: read-only pointer, or nullptr.
     const Value* find(const Key& key) const {
-        return const_cast<AVLTree*>(this)->find(key);
+        const Node* n = find_node(key);
+        return n ? &n->value : nullptr;
     }
 
-    // Returns pointers to the best (lowest ask or highest bid) key and value.
+    // True if `key` is present.
+    bool contains(const Key& key) const { return find_node(key) != nullptr; }
+
+    // Returns the best (first in Compare order) key and its Value, or {nullptr, nullptr} when empty. 
+    // O(log n) time;  The pointers stay valid until that key is erased.
     std::pair<const Key*, Value*> best() {
-        if (!root_) return {nullptr, nullptr};
-        inc_visited();
-        Node* best_node = min_value_node(root_);
-        return {&best_node->key, &best_node->value};
+        Node* n = leftmost();
+        if (!n) return {nullptr, nullptr};
+        return {&n->key, &n->value};
     }
 
-    // Removes the node matching `key` from the tree and returns true if a node was deleted.
+    // Const overload of best().
+    std::pair<const Key*, const Value*> best() const {
+        const Node* n = leftmost();
+        if (!n) return {nullptr, nullptr};
+        return {&n->key, &n->value};
+    }
+
+    // Removes `key`. Returns true if a node was removed. O(log n).
     bool erase(const Key& key) {
-        bool removed = false;
-        root_ = remove_node(root_, key, removed);
-        return removed;
+        const Key key_copy = key;  // `key` may point into the node being deleted (e.g. *best().first)
+        const std::size_t before = size_;
+        root_ = remove_node(root_, key_copy);
+        return size_ < before;
     }
 
-    // Retrieves and processes top depth price levels in exact sorted order to implement BOOK [depth] command without sorting entire order book.
+    // Calls fn(key, value) on the first `depth` entries in Compare order (best first)
+    // without sorting or visiting the whole tree. Used for BOOK [depth].
     template <typename Func>
     void traverse_top_n(std::size_t depth, Func&& fn) const {
         std::size_t count = 0;
-        in_order_limit(root_, depth, count, std::forward<Func>(fn));
+        in_order_limit(root_, depth, count, fn);
     }
 
-    // Returns true if the tree contains zero price levels.
+    // Removes every entry.
+    void clear() {
+        destroy_tree(root_);
+        root_ = nullptr;
+        size_ = 0;
+    }
+
+    // True if the tree holds no entries.
     bool empty() const { return size_ == 0; }
 
-    // Returns the total number of active nodes (price levels) currently in the tree.
+    // Number of entries (price levels).
     std::size_t size() const { return size_; }
 
-    // Calculates the total heap and object memory footprint in bytes for M5 benchmarks.
-    std::size_t memory_bytes() const {
-        return sizeof(*this) + size_ * sizeof(Node);
+    // Tree height (0 for an empty tree); at most about 1.44 * log2(n + 2).
+    int height() const { return height(root_); }
+
+    // Checks BST order, cached heights, AVL balance and size_.
+    bool validate() const {
+        int h = 0;
+        std::size_t count = 0;
+        return validate_node(root_, nullptr, nullptr, h, count) && count == size_;
     }
+
+    // Bytes used by the tree structure itself: the object plus one Node per entry.
+    // Heap memory owned INSIDE each Value and allocator overhead are not included.
+    std::size_t memory_bytes() const { return sizeof(*this) + size_ * sizeof(Node); }
 };
 
 } // namespace team
